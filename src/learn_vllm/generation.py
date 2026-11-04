@@ -44,10 +44,12 @@ def greedy_generate(
     for step in range(max_new_tokens):
         # At iteration `step`, sequence length is L + step.
         output_logits = model(sequence)
+        # output_logits: [1, L + step, V]
 
         if step == 0:
             # Save the full prefill logits once, as one of the result tensors.
             prefill_logits = output_logits.float().cpu().clone()
+            # prefill_logits: [1, L, V]
 
         logits = output_logits[:, -1, :]
         # logits: [1, V]
