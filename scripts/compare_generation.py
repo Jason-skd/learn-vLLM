@@ -39,11 +39,13 @@ def run_case(model, tokenizer, case, config, expected, eos_token_ids):
     torch.testing.assert_close(ids.cpu(), expected["input_ids"], rtol=0, atol=0)
 
     # ---------- 2. generate ----------
+    cache = model.create_kv_cache(ids.shape[1] + config["generation"]["max_new_tokens"])
     result = greedy_generate(
         model,
         ids,
         max_new_tokens=config["generation"]["max_new_tokens"],
         eos_token_ids=eos_token_ids,
+        cache=cache,
     )
 
     # ---------- 3. compare ----------

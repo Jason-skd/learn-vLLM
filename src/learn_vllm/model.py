@@ -3,6 +3,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from transformers import Qwen3Config
 
+from .kv_cache import KVCache
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization: Normalizes the last dimension and
@@ -92,22 +94,35 @@ def apply_rope(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, 
     return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 
 
-def causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-    """Computes grouped-query causal attention without padding or KV cache.
+def causal_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    query_positions: Tensor,
+) -> Tensor:
+    """Computes grouped-query causal attention for new query tokens.
 
     Args:
-        q: [B, Hq, L, D]
-        k: [B, Hkv, L, D]
-        v: [B, Hkv, L, D]
+        q: [B, Hq, T, D]
+        k: [B, Hkv, Lused, D]
+        v: [B, Hkv, Lused, D]
+        query_positions: [B, T], absolute positions of the new queries.
     Returns:
-        [B, Hq, L, D]
+        [B, Hq, T, D]
     """
-    # ---------- 1. obtain the quantity of attention heads ----------
+    # ---------- 1. obtain and validate the quantity of attention heads ----------
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Queries, keys and values must be rank-4 tensors.")
+
     query_heads, kv_heads = q.shape[1], k.shape[1]
     if kv_heads <= 0 or query_heads <= 0 or query_heads % kv_heads != 0:
         raise ValueError("Query heads must be a positive multiple of KV heads.")
-    if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
-        raise ValueError("Queries, keys and values must have matching B, L and D.")
+    if k.shape != v.shape:
+        raise ValueError("Keys and values must have the same shape.")
+    if q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
+        raise ValueError("Queries, keys and values must have matching B and D.")
+    if query_positions.shape != (q.shape[0], q.shape[-2]):
+        raise ValueError("query_positions must have shape [B, T].")
 
     # --------- 2. duplicate the KV header ----------
     groups = query_heads // kv_heads
@@ -116,14 +131,19 @@ def causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     # k/v: [B, Hq, L, D], notice that Hkv -> Hq
 
     # --------- 3. compute the attention ----------
-    length, head_dim = q.shape[-2:]
+    _, head_dim = q.shape[-2:]
     scores = (q @ k.transpose(-2, -1)) * (head_dim**-0.5)
-    # scores: [B, Hq, L, L]
+    # scores: [B, Hq, T, Lused]
 
     # --------- 4. mask out future tokens ----------
-    future = torch.ones(length, length, dtype=torch.bool, device=q.device).triu(1)
-    scores = scores.masked_fill(future, float("-inf"))
-    # Rows are query positions; columns beyond each query are future tokens.
+    key_length = k.shape[-2]
+    key_positions = torch.arange(key_length, device=q.device)
+
+    future = key_positions.view(1, 1, -1) > query_positions.unsqueeze(-1)
+    # future: [B, T, L]
+
+    scores = scores.masked_fill(future.unsqueeze(1), float("-inf"))
+    # mask broadcast: [B, 1, T, L], scores: [B, Hq, T, L]
 
     # --------- 5. calculate the probability ----------
     probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -186,15 +206,27 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        position_ids: Tensor,
+        *,
+        cache: KVCache | None = None,
+        layer_idx: int | None = None,
+    ) -> Tensor:
         """Projects, normalizes and rotates queries and keys before attention.
 
         Args:
-            x: [B, L, hidden_size]
-            cos: [B, L, D]
-            sin: [B, L, D]
+            x: [B, T, hidden_size]
+            cos: [B, T, D]
+            sin: [B, T, D]
+            position_ids: [B, T] absolute token positions.
+            cache: Optional KV cache for this request.
+            layer_idx: Index of this attention layer in the decoder.
         Returns:
-            [B, L, hidden_size]
+            [B, T, hidden_size]
         """
         # ---------- 1. project and split attention heads ----------
         batch, length, _ = x.shape
@@ -206,13 +238,22 @@ class Attention(nn.Module):
         q = self.q_norm(q).transpose(1, 2)
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
-        # q: [B, Hq, L, D]; k/v: [B, Hkv, L, D]
+        # q: [B, Hq, T, D]; new k/v: [B, Hkv, T, D]
         q, k = apply_rope(q, k, cos, sin)
 
-        # ---------- 3. compute attention and merge heads ----------
-        output = causal_attention(q, k, v)
+        # ---------- 3. append new K/V and read the valid cache prefix ----------
+        if cache is not None:
+            if layer_idx is None:
+                raise ValueError("layer_idx is required when cache is provided.")
+            k, v = cache.append(layer_idx, k, v)
+            # k, v: [B, Hkv, Lused, D]
+
+        # ---------- 4. compute attention and merge heads ----------
+        output = causal_attention(q, k, v, position_ids)
+        # output: [B, Hq, T, D]
+
         output = output.transpose(1, 2).reshape(batch, length, -1)
-        # output: [B, L, Hq * D], which need not equal hidden_size
+        # output: [B, T, Hq * D], which need not equal hidden_size
         return self.o_proj(output)
 
 
@@ -226,20 +267,32 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        position_ids: Tensor,
+        *,
+        cache: KVCache | None = None,
+        layer_idx: int | None = None,
+    ) -> Tensor:
         """Applies attention and the feed-forward transformation.
 
         Args:
-            x: [B, L, hidden_size]
-            cos: [B, L, D]
-            sin: [B, L, D]
+            x: [B, T, hidden_size]
+            cos: [B, T, D]
+            sin: [B, T, D]
+            position_ids: [B, T] absolute token positions.
+            cache: Optional KV cache for this request.
+            layer_idx: Index of this attention layer in the decoder.
         Returns:
-            [B, L, hidden_size]
+            [B, T, hidden_size]
         """
         # ---------- 1. attention with residual connection ----------
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, cos, sin)
+        x = self.self_attn(x, cos, sin, position_ids, cache=cache, layer_idx=layer_idx)
         x = residual + x
 
         # ---------- 2. MLP with residual connection ----------
@@ -250,7 +303,7 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    """Qwen3 Backbone: Runs one unpadded sequence without a KV cache.
+    """Qwen3 Backbone: Runs one unpadded sequence with optional continuous cache.
 
     Only default RoPE, full attention and SiLU are supported. Dropout must be
     zero; this implementation is intended for inference with loaded weights.
@@ -285,28 +338,44 @@ class Qwen3Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, *, cache: KVCache | None = None) -> Tensor:
         """Embeds input tokens and runs all decoder layers.
 
         Args:
-            input_ids: [1, L], a nonempty sequence without padding.
+            input_ids: [1, T], a nonempty sequence without padding.
+            cache: Optional KV cache containing previously processed tokens.
         Returns:
-            [1, L, hidden_size]
+            [1, T, hidden_size]
         """
+        # ---------- 1. validate input and the shared cache range ----------
         if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
             raise ValueError("input_ids must have shape [1, L] with L > 0.")
 
-        # ---------- 1. embed tokens and compute shared position embeddings ----------
-        x = self.embed_tokens(input_ids)
-        positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(
-            0
-        )
-        cos, sin = self.rotary_emb(positions, x.dtype)
-        # cos/sin: [1, L, D], reused by every decoder layer
+        token_count = input_ids.shape[1]
+        start = cache.length if cache is not None else 0
+        if cache is not None:
+            cache.ensure_capacity(token_count)
 
-        # ---------- 2. run decoder layers and normalize ----------
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        # ---------- 2. embed tokens and compute shared position embeddings ----------
+        x = self.embed_tokens(input_ids)
+        positions = torch.arange(
+            start,
+            start + token_count,
+            device=input_ids.device,
+        ).unsqueeze(0)
+        # positions: [1, T] int64 absolute token positions
+
+        cos, sin = self.rotary_emb(positions, x.dtype)
+        # cos/sin: [1, T, D], reused by every decoder layer
+
+        # ---------- 3. run decoder layers and normalize ----------
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, positions, cache=cache, layer_idx=layer_idx)
+
+        # ---------- 4. advance only after every layer has written the token range ----------
+        if cache is not None:
+            cache.advance(token_count)
+
         return self.norm(x)
 
 
@@ -321,13 +390,41 @@ class Qwen3ForCausalLM(nn.Module):
             # Share the parameter itself so loading embeddings also updates the head.
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def create_kv_cache(self, max_seq_len: int) -> KVCache:
+        """Creates a cache configured from this model's attention layers.
+
+        Args:
+            max_seq_len: Maximum number of prompt and generated tokens.
+        Returns:
+            An empty continuous KV cache for one request.
+        """
+        # ---------- 1. read dimensions from the loaded model ----------
+        embedding = self.model.embed_tokens.weight
+        attention = self.model.layers[0].self_attn
+
+        # ---------- 2. allocate cache with the model's runtime dtype and device ----------
+        return KVCache(
+            num_layers=len(self.model.layers),
+            num_kv_heads=attention.num_kv_heads,
+            head_dim=attention.head_dim,
+            max_seq_len=max_seq_len,
+            dtype=embedding.dtype,
+            device=embedding.device,
+        )
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        *,
+        cache: KVCache | None = None,
+    ) -> Tensor:
         """Computes logits for every input position without generating tokens.
 
         Args:
-            input_ids: [1, L], a nonempty sequence without padding.
+            input_ids: [1, T], a nonempty sequence without padding.
+            cache: Optional KV cache containing previously processed tokens.
         Returns:
-            [1, L, vocab_size]
+            [1, T, vocab_size]
         """
-        hidden_states = self.model(input_ids)
+        hidden_states = self.model(input_ids, cache=cache)
         return self.lm_head(hidden_states)

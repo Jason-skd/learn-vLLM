@@ -104,6 +104,39 @@ def test_future_tokens_do_not_change_prefix_logits():
     torch.testing.assert_close(model(ids)[:, :3], model(ids[:, :3]))
 
 
+@torch.inference_mode()
+def test_cached_decode_matches_full_forward():
+    """Checks that continuous cache reuse produces the uncached decode logits."""
+    # ---------- 1. build a model and prefill a three-token prompt ----------
+    torch.manual_seed(42)
+    model = Qwen3ForCausalLM(make_config()).eval()
+    prompt = torch.tensor([[1, 2, 3]])
+    cache = model.create_kv_cache(max_seq_len=5)
+
+    cached_prefill = model(prompt, cache=cache)
+    full_prefill = model(prompt)
+    # cached_prefill/full_prefill: [1, 3, V]
+
+    torch.testing.assert_close(cached_prefill, full_prefill, rtol=1e-4, atol=1e-5)
+    assert cache.length == 3
+
+    # ---------- 2. decode one token at each absolute position ----------
+    next_token = torch.tensor([[4]])
+    cached_logits = model(next_token, cache=cache)
+    full_logits = model(torch.tensor([[1, 2, 3, 4]]))[:, -1:, :]
+    # cached_logits/full_logits: [1, 1, V]
+
+    torch.testing.assert_close(cached_logits, full_logits, rtol=1e-4, atol=1e-5)
+    assert cache.length == 4
+
+    next_token = torch.tensor([[5]])
+    cached_logits = model(next_token, cache=cache)
+    full_logits = model(torch.tensor([[1, 2, 3, 4, 5]]))[:, -1:, :]
+
+    torch.testing.assert_close(cached_logits, full_logits, rtol=1e-4, atol=1e-5)
+    assert cache.length == 5
+
+
 @pytest.mark.parametrize("shape", [(0,), (1, 0), (2, 3), (1, 2, 3)])
 def test_rejects_unsupported_input_shapes(shape):
     """Rejects empty sequences, multiple requests and tensors with the wrong rank."""
