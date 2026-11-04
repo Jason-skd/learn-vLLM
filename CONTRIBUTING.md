@@ -20,6 +20,12 @@ uv run python scripts/build_reference.py
 
 默认加载 Qwen3-0.6B，将固定用例的 logits 和 greedy 生成结果写入 `reference/outputs.pt`（会覆盖旧文件，不纳入 Git）。使用本地模型时，将 `reference/config.json` 的 `model.id` 改为完整模型目录的绝对路径；仅使用本地文件或缓存时，在命令前加 `HF_HUB_OFFLINE=1`。配置细节见 [CHANGELOG.md](CHANGELOG.md)。
 
+生成参考产物后，将本实现的单请求 greedy 生成结果与其比较：
+
+```bash
+uv run python scripts/compare_generation.py
+```
+
 ## 文档索引
 
 - [ROADMAP.md](ROADMAP.md)：实现阶段切分与规划。
