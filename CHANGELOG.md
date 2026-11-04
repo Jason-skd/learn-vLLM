@@ -1,5 +1,12 @@
 # Changelog
 
+## 8b36b25 — 连续单请求 KV Cache
+
+- 新增 `KVCache`，按层保存连续 K/V 缓冲区；`Qwen3ForCausalLM.create_kv_cache(max_seq_len)` 按模型的层数、KV 头数、头维度、dtype 和设备创建单请求缓存。
+- `Qwen3ForCausalLM.forward` 和 `greedy_generate` 新增可选 `cache`。传入空缓存时，首轮处理完整 prompt，后续只处理新 token，并从缓存长度续接 RoPE 位置；不传缓存仍沿用每步重算完整上下文。
+- 缓存容量必须覆盖 prompt 与后续处理 token 的总数，超过 `max_seq_len` 时抛出 `ValueError`。当前仅支持非空、无 padding 的单请求和连续缓存；不同请求的批处理、分页、回收及动态调度尚未实现。
+- 新增测试验证 cached prefill / decode logits 与完整前向一致，`greedy_generate` 的 cached 调用序列和生成结果正确。
+
 ## c0dfa4a — KV Cache 参考基线
 
 - `scripts/build_reference.py` 现在为每个固定用例同时生成整句重算（`full`）和 Transformers `DynamicCache` 增量解码（`cached`）两套参考结果。参考产物升级为 schema 2，并记录支持的生成模式与缓存实现。
