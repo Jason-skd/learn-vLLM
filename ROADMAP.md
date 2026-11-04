@@ -1,6 +1,6 @@
 # Roadmap
 
-- [ ] **参考基线**：用 Transformers 加载官方权重，保存固定输入的 logits 和 greedy 生成结果。
+- [ ] **参考基线**：用 Transformers 加载官方权重，保存固定输入的 logits 和 greedy 生成结果。已实施（`0be68a9`）；待收尾：实际模型运行验收。
 - [ ] **模型前向**：用 PyTorch 实现 Qwen3，加载官方权重，验证 logits 与参考实现对齐。
 - [ ] **单请求生成**：每步重算完整上下文，实现 greedy 生成并与参考结果比较。
 - [ ] **KV Cache**：实现连续缓存，拆分 prefill / decode，逐步对齐无缓存版本的 logits。
