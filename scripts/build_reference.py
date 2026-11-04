@@ -3,6 +3,7 @@
 import json
 import platform
 from pathlib import Path
+from typing import Literal
 
 import torch
 import transformers
@@ -10,10 +11,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # reference/ dir at project root; both config.json and outputs.pt live here
 REFERENCE_DIR = Path(__file__).resolve().parents[1] / "reference"
+REFERENCE_SCHEMA_VERSION = 2
+ReferenceMode = Literal["full", "cached"]
+REFERENCE_MODES: tuple[ReferenceMode, ...] = ("full", "cached")
 
 
 @torch.inference_mode()  # inference mode: no grad, less memory, faster, same results
-def run_case(model, tokenizer, case, config):
+def run_case(model, tokenizer, case, config, cache_mode: ReferenceMode):
+    """Generate one greedy reference using the selected attention path."""
     # shape notation: B=1 (batch), L=input tokens, N=generated tokens, V=vocab size
 
     # ---------- 1. tokenize ----------
@@ -30,6 +35,8 @@ def run_case(model, tokenizer, case, config):
 
     # ---------- 2. prepare vars ----------
     sequence, attention = ids, mask
+    step_input = ids  # the full prompt during prefill and new token afterward
+    past_key_values = None
     # sequence:  [1, L]  grows to [1, L + step] as new tokens are appended
     # attention: [1, L]  grows in lockstep, always same length as sequence
 
@@ -44,12 +51,14 @@ def run_case(model, tokenizer, case, config):
     stop_reason = "max_new_tokens"  # default
 
     # ---------- 3. generate ----------
+    use_cache = cache_mode == "cached"
     for step in range(config["generation"]["max_new_tokens"]):
         # at iteration `step`, sequence length is L + step
         output = model(
-            input_ids=sequence,
+            input_ids=step_input if use_cache else sequence,
             attention_mask=attention,
-            use_cache=False,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
         # output: CausalLMOutputWithPast
         # output.logits: [1, L + step, V]
@@ -77,6 +86,10 @@ def run_case(model, tokenizer, case, config):
 
         attention = torch.cat((attention, torch.ones_like(token)), dim=1)
         # attention: [1, L + step + 1]  append one more 1
+        if use_cache:
+            past_key_values = output.past_key_values
+            step_input = token
+            # step_input: [1, 1]  only the new token is processed
 
     # ---------- 4. pack ----------
     new_ids = torch.cat(generated, dim=1)
@@ -93,10 +106,9 @@ def run_case(model, tokenizer, case, config):
     }
 
 
-def main():
-    # ---------- 1. load & validate config ----------
-    config = json.loads((REFERENCE_DIR / "config.json").read_text(encoding="utf-8"))
-
+def build_artifact(config):
+    """Build full-context and cached references from one official model."""
+    # ---------- 1. validate config ----------
     if config["generation"]["max_new_tokens"] < 1:
         raise ValueError("max_new_tokens must be positive")
 
@@ -120,7 +132,8 @@ def main():
 
     # ---------- 3. build artifact ----------
     artifact = {
-        "schema_version": 1,
+        "schema_version": REFERENCE_SCHEMA_VERSION,
+        "reference_modes": list(REFERENCE_MODES),
         "config": config,
         "runtime": {
             # environment fingerprint
@@ -131,17 +144,32 @@ def main():
             "device": mc["device"],
             "dtype": mc["dtype"],
             "attention_implementation": "eager",
+            "cache_implementation": "DynamicCache",
         },
         "cases": {},
     }
 
-    # ---------- 4. run all cases ----------
+    # ---------- 4. run all cases in both modes ----------
     for case in config["cases"]:
-        result = run_case(model, tokenizer, case, config)
-        artifact["cases"][case["id"]] = result
-        print(f"{case['id']}: {result['generated_text']!r}")
+        results = {
+            mode: run_case(model, tokenizer, case, config, mode)
+            for mode in REFERENCE_MODES
+        }
+        full = results["full"]
+        artifact["cases"][case["id"]] = {
+            "input_ids": full["input_ids"],
+            "attention_mask": full["attention_mask"],
+            "modes": results,
+        }
+        for mode, result in results.items():
+            print(f"{case['id']}/{mode}: {result['generated_text']!r}")
 
-    # ---------- 5. save ----------
+    return artifact
+
+
+def main():
+    config = json.loads((REFERENCE_DIR / "config.json").read_text(encoding="utf-8"))
+    artifact = build_artifact(config)
     destination = REFERENCE_DIR / "outputs.pt"
     torch.save(artifact, destination)  # pickle-based; handles dict + tensors
     print(f"Saved {destination}")
