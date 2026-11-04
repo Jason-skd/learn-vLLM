@@ -46,7 +46,6 @@ def greedy_generate(
         raise ValueError("max_new_tokens must be positive")
 
     # ---------- 2. prepare vars ----------
-    sequence = input_ids
     step_input = input_ids
     generated, step_logits = [], []
 
@@ -61,14 +60,9 @@ def greedy_generate(
 
     # ---------- 3. generate ----------
     for step in range(max_new_tokens):
-        if cache is None:
-            # Without a cache, every step recomputes the full sequence.
-            output_logits = model(sequence)
-            # output_logits: [1, L + step, V]
-        else:
-            # The first call is prefill; later calls process one new token.
-            output_logits = model(step_input, cache=cache)
-            # output_logits: [1, L, V] during prefill and [1, 1, V] during decode
+        output_logits = model(step_input, cache=cache)
+        # Without cache: [1, L + step, V]
+        # With cache: prefill [1, L, V], then decode [1, 1, V]
 
         if step == 0:
             # Save the full prefill logits once, as one of the result tensors.
@@ -89,8 +83,8 @@ def greedy_generate(
             break
 
         if cache is None:
-            sequence = torch.cat((sequence, token), dim=1)
-            # sequence: [1, L + step + 1]
+            step_input = torch.cat((step_input, token), dim=1)
+            # step_input: [1, L + step + 1]
         else:
             step_input = token
             # step_input: [1, 1]
