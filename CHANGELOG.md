@@ -1,5 +1,17 @@
 # Changelog
 
+## 448e0dc — 单请求 greedy 生成
+
+- 新增 `src/learn_vllm/generation.py` 的 `greedy_generate`。传入单请求 `input_ids`、`max_new_tokens` 和可选 EOS token 集合，返回 prefill logits、生成 token、逐步 logits 与停止原因。EOS token 会保留在生成结果中。
+- 当前生成每步重新执行完整上下文前向；仅支持非空、无 padding 的单请求和 greedy 解码，尚不支持 KV Cache。默认 pytest 使用桩模型验证 EOS、长度上限和逐步执行，不下载官方权重。
+- 新增 `scripts/compare_generation.py`，使用 `reference/config.json` 的 tokenizer 与模型设置加载本实现，并与 `reference/outputs.pt` 比较生成 token、logits、停止原因和文本。模型配置与参考产物中的生成设置不一致时会提示重新生成产物。
+
+```bash
+uv run python scripts/compare_generation.py
+```
+
+- 使用 Qwen3-0.6B 本地权重在 CPU、float32 下完成英文、中文和代码三个固定用例验收；生成结果及 logits 均与参考产物对齐。
+
 ## de2e3fb — Qwen3 模型前向
 
 - 新增 `src/learn_vllm/model.py`，使用 PyTorch 组装 Attention、Decoder 层、模型骨干和词表输出层。传入 Transformers 的 `Qwen3Config` 构造 `Qwen3ForCausalLM`，调用 `model(input_ids)` 返回全部输入位置的 logits，形状为 `[1, L, vocab_size]`。
