@@ -14,6 +14,8 @@ pytestmark = pytest.mark.integration
 
 # reference/ dir at project root; config.json and outputs.pt live here
 REFERENCE_DIR = Path(__file__).resolve().parents[1] / "reference"
+REFERENCE_SCHEMA_VERSION = 2
+REFERENCE_MODES = ("full", "cached")
 
 
 def load_config():
@@ -26,6 +28,8 @@ def pytest_generate_tests(metafunc):
     if "case" in metafunc.fixturenames:
         cases = load_config()["cases"]
         metafunc.parametrize("case", cases, ids=[case["id"] for case in cases])
+    if "mode" in metafunc.fixturenames:
+        metafunc.parametrize("mode", REFERENCE_MODES)
 
 
 def resolve_model_id(config, reference_config):
@@ -49,8 +53,10 @@ def reference_artifact():
         )
 
     artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
-    if artifact.get("schema_version") != 1:
+    if artifact.get("schema_version") != REFERENCE_SCHEMA_VERSION:
         raise ValueError("Unsupported reference artifact schema version")
+    if artifact.get("reference_modes") != list(REFERENCE_MODES):
+        raise ValueError("Reference artifact does not contain both generation modes")
 
     config = load_config()
     reference_config = artifact["config"]
@@ -97,9 +103,10 @@ def runtime(reference_artifact):
 
 
 @torch.inference_mode()
-def run_case(model, tokenizer, case, config, expected, eos_token_ids):
+def run_case(model, tokenizer, case, config, case_reference, mode, eos_token_ids):
     """Assert tokenization, logits, generated IDs, stop reason and decoded text."""
     # shape notation: B=1 (batch), L=input tokens, N=generated tokens, V=vocab size
+    expected = case_reference["modes"][mode]
 
     # ---------- 1. tokenize ----------
     inputs = tokenizer(
@@ -109,10 +116,14 @@ def run_case(model, tokenizer, case, config, expected, eos_token_ids):
     ).to(config["model"]["device"])
     ids = inputs["input_ids"]
     # ids: [1, L] int64
-    torch.testing.assert_close(ids.cpu(), expected["input_ids"], rtol=0, atol=0)
+    torch.testing.assert_close(ids.cpu(), case_reference["input_ids"], rtol=0, atol=0)
 
     # ---------- 2. generate ----------
-    cache = model.create_kv_cache(ids.shape[1] + config["generation"]["max_new_tokens"])
+    cache = None
+    if mode == "cached":
+        cache = model.create_kv_cache(
+            ids.shape[1] + config["generation"]["max_new_tokens"]
+        )
     result = greedy_generate(
         model,
         ids,
@@ -152,8 +163,8 @@ def run_case(model, tokenizer, case, config, expected, eos_token_ids):
     return generated_text
 
 
-def test_generation_matches_reference(runtime, reference_artifact, case):
-    """Compare one configured case with its saved Transformers output."""
+def test_generation_matches_reference(runtime, reference_artifact, case, mode):
+    """Compare one generation mode with its matching Transformers output."""
     config, artifact, artifact_path = reference_artifact
     case_id = case["id"]
     if case_id not in artifact["cases"]:
@@ -166,6 +177,7 @@ def test_generation_matches_reference(runtime, reference_artifact, case):
         case,
         config,
         artifact["cases"][case_id],
+        mode,
         eos_ids,
     )
-    print(f"{case_id}: {generated_text!r} (matched {artifact_path})")
+    print(f"{case_id}/{mode}: {generated_text!r} (matched {artifact_path})")

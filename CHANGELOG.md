@@ -1,5 +1,11 @@
 # Changelog
 
+## c0dfa4a — KV Cache 参考基线
+
+- `scripts/build_reference.py` 现在为每个固定用例同时生成整句重算（`full`）和 Transformers `DynamicCache` 增量解码（`cached`）两套参考结果。参考产物升级为 schema 2，并记录支持的生成模式与缓存实现。
+- 集成测试按 `full` 和 `cached` 分别执行，本实现的每条生成路径只与同模式的参考结果比较；生成的 token、文本和停止原因仍要求完全一致。
+- schema 1 产物不再兼容。升级后必须重新运行 `uv run python scripts/build_reference.py`，否则集成测试会拒绝加载旧产物。
+
 ## 269f03d — 参考生成集成测试
 
 - 将 `scripts/compare_generation.py` 迁移为 `tests/test_generation_reference.py`，按 `reference/config.json` 的用例逐个报告 tokenizer、logits、生成 token、停止原因和文本的对比结果。

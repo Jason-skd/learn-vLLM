@@ -18,9 +18,15 @@ uv run pytest
 uv run python scripts/build_reference.py
 ```
 
-默认加载 Qwen3-0.6B，将固定用例的 logits 和 greedy 生成结果写入 `reference/outputs.pt`（会覆盖旧文件，不纳入 Git）。使用本地模型时，将 `reference/config.json` 的 `model.id` 改为完整模型目录的绝对路径；仅使用本地文件或缓存时，在命令前加 `HF_HUB_OFFLINE=1`。配置细节见 [CHANGELOG.md](CHANGELOG.md)。
+默认加载 Qwen3-0.6B，将固定用例的整句重算（`full`）和官方
+`DynamicCache` 增量解码（`cached`）两套 logits 与 greedy 生成结果写入
+`reference/outputs.pt`（会覆盖旧文件，不纳入 Git）。使用本地模型时，将
+`reference/config.json` 的 `model.id` 改为完整模型目录的绝对路径；仅使用本地
+文件或缓存时，在命令前加 `HF_HUB_OFFLINE=1`。配置细节见
+[CHANGELOG.md](CHANGELOG.md)。
 
-生成参考产物后，使用集成测试将本实现的单请求 greedy 生成结果与其比较。
+生成参考产物后，使用集成测试将本实现的 `full` 与 `cached` 单请求 greedy
+生成结果分别与同模式参考比较。
 默认 pytest 会排除 `integration` 测试，避免下载模型权重：
 
 ```bash
