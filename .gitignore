@@ -1,1 +1,6 @@
 .DS_Store
+.venv
+.ruff_cache
+
+# reference outputs
+reference/outputs.pt

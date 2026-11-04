@@ -1,0 +1,30 @@
+{
+    "schema_version": 1,
+    "model": {
+        "id": "Qwen/Qwen3-0.6B",
+        "revision": "main",
+        "dtype": "float32",
+        "device": "cpu"
+    },
+    "tokenization": {
+        "add_special_tokens": false
+    },
+    "generation": {
+        "max_new_tokens": 16,
+        "stop_on_eos": true
+    },
+    "cases": [
+        {
+            "id": "english",
+            "text": "The capital of France is"
+        },
+        {
+            "id": "chinese",
+            "text": "中国的首都是"
+        },
+        {
+            "id": "code",
+            "text": "def add(a, b):\n    return"
+        }
+    ]
+}
