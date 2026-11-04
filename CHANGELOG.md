@@ -1,5 +1,11 @@
 # Changelog
 
+## 269f03d — 参考生成集成测试
+
+- 将 `scripts/compare_generation.py` 迁移为 `tests/test_generation_reference.py`，按 `reference/config.json` 的用例逐个报告 tokenizer、logits、生成 token、停止原因和文本的对比结果。
+- 参考用例标记为 `integration`，默认 `uv run pytest` 不加载真实模型权重；生成 `reference/outputs.pt` 后使用 `uv run pytest -m integration tests/test_generation_reference.py` 执行验收。缺少参考产物时测试会跳过并提示先运行 `scripts/build_reference.py`。
+- `scripts/build_reference.py` 继续作为参考产物生成入口。模型精度、设备或生成配置与参考产物不一致时，集成测试会要求重新生成产物。
+
 ## 448e0dc — 单请求 greedy 生成
 
 - 新增 `src/learn_vllm/generation.py` 的 `greedy_generate`。传入单请求 `input_ids`、`max_new_tokens` 和可选 EOS token 集合，返回 prefill logits、生成 token、逐步 logits 与停止原因。EOS token 会保留在生成结果中。
