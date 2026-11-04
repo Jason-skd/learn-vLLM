@@ -23,6 +23,8 @@ def greedy_generate(
     max_new_tokens: int,
     eos_token_ids: int | list[int] | None = None,
 ) -> GenerationResult:
+    # shape notation: B=1 (batch), L=input tokens, N=generated tokens, V=vocab size
+
     # ---------- 1. validate input ----------
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
