@@ -9,6 +9,7 @@
 ```bash
 uv run ruff format .
 uv run ruff check --fix .
+uv run pytest
 ```
 
 在项目根目录运行参考生成脚本：
