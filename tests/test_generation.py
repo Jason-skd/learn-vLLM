@@ -3,6 +3,7 @@ import torch
 from torch import Tensor, nn
 
 from learn_vllm.generation import greedy_generate
+from learn_vllm.kv_cache import KVCache
 
 
 class LastTokenModel(nn.Module):
@@ -13,9 +14,14 @@ class LastTokenModel(nn.Module):
         self.next_tokens = next_tokens
         self.vocab_size = vocab_size
         self.input_lengths: list[int] = []
+        self.cache_inputs: list[KVCache | None] = []
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, *, cache: KVCache | None = None) -> Tensor:
         self.input_lengths.append(input_ids.shape[1])
+        self.cache_inputs.append(cache)
+        if cache is not None:
+            cache.advance(input_ids.shape[1])
+
         token = self.next_tokens[len(self.input_lengths) - 1]
         logits = torch.full(
             (*input_ids.shape, self.vocab_size),
@@ -39,6 +45,38 @@ def test_greedy_generate_recomputes_full_context_until_length_limit():
     )
     assert result.prefill_logits.shape == (1, 2, model.vocab_size)
     assert result.generation_logits.shape == (1, 3, model.vocab_size)
+    assert result.stop_reason == "max_new_tokens"
+    torch.testing.assert_close(input_ids, torch.tensor([[1, 6]]), rtol=0, atol=0)
+
+
+def test_greedy_generate_uses_cache_and_feeds_one_token_at_a_time():
+    """Checks the cached call pattern, greedy result and packed tensor shapes."""
+    model = LastTokenModel([2, 4, 3])
+    cache = KVCache(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+        max_seq_len=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    input_ids = torch.tensor([[1, 6]])
+
+    result = greedy_generate(
+        model,
+        input_ids,
+        max_new_tokens=2,
+        cache=cache,
+    )
+
+    assert model.input_lengths == [2, 1]
+    assert all(actual is cache for actual in model.cache_inputs)
+    assert cache.length == 3
+    torch.testing.assert_close(
+        result.generated_ids, torch.tensor([[2, 4]]), rtol=0, atol=0
+    )
+    assert result.prefill_logits.shape == (1, 2, model.vocab_size)
+    assert result.generation_logits.shape == (1, 2, model.vocab_size)
     assert result.stop_reason == "max_new_tokens"
     torch.testing.assert_close(input_ids, torch.tensor([[1, 6]]), rtol=0, atol=0)
 

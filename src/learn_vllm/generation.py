@@ -4,6 +4,8 @@ from typing import Literal
 import torch
 from torch import Tensor, nn
 
+from .kv_cache import KVCache
+
 StopReason = Literal["eos", "max_new_tokens"]
 
 
@@ -22,13 +24,29 @@ def greedy_generate(
     *,
     max_new_tokens: int,
     eos_token_ids: int | list[int] | None = None,
+    cache: KVCache | None = None,
 ) -> GenerationResult:
+    """Generates greedy tokens with optional continuous KV cache support.
+
+    Args:
+        model: A causal language model returning logits for new input positions.
+        input_ids: [1, L], a nonempty prompt without padding.
+        max_new_tokens: Maximum number of tokens to generate.
+        eos_token_ids: Optional token IDs that stop generation.
+        cache: Optional empty KV cache for one request. When omitted, the full
+            context is recomputed at every step.
+    Returns:
+        Packed prefill logits, generated IDs, step logits and stop reason.
+    """
+    # shape notation: B=1 (batch), L=input tokens, N=generated tokens, V=vocab size
+    # In cached mode, later calls pass T=1 new token instead of the full sequence.
+
     # ---------- 1. validate input ----------
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
 
     # ---------- 2. prepare vars ----------
-    sequence = input_ids
+    step_input = input_ids
     generated, step_logits = [], []
 
     # eos may be None / int / list[int]; normalize to a set for O(1) lookup
@@ -42,9 +60,9 @@ def greedy_generate(
 
     # ---------- 3. generate ----------
     for step in range(max_new_tokens):
-        # At iteration `step`, sequence length is L + step.
-        output_logits = model(sequence)
-        # output_logits: [1, L + step, V]
+        output_logits = model(step_input, cache=cache)
+        # Without cache: [1, L + step, V]
+        # With cache: prefill [1, L, V], then decode [1, 1, V]
 
         if step == 0:
             # Save the full prefill logits once, as one of the result tensors.
@@ -64,8 +82,12 @@ def greedy_generate(
             stop_reason = "eos"
             break
 
-        sequence = torch.cat((sequence, token), dim=1)
-        # sequence: [1, L + step + 1]
+        if cache is None:
+            step_input = torch.cat((step_input, token), dim=1)
+            # step_input: [1, L + step + 1]
+        else:
+            step_input = token
+            # step_input: [1, 1]
 
     # ---------- 4. pack ----------
     new_ids = torch.cat(generated, dim=1)
