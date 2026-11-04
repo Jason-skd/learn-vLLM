@@ -1,6 +1,8 @@
 .DS_Store
 .venv
 .ruff_cache
+__pycache__
+.pytest_cache
 
 # reference outputs
 reference/outputs.pt
