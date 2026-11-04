@@ -51,6 +51,8 @@ def run_case(model, tokenizer, case, config):
             attention_mask=attention,
             use_cache=False,
         )
+        # output: CausalLMOutputWithPast
+        # output.logits: [1, L + step, V]
 
         if step == 0:
             # save the full prefill logits once, as one of the reference tensors
