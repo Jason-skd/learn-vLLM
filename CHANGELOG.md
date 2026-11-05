@@ -1,5 +1,13 @@
 # Changelog
 
+## a19f1fe — 固定批处理
+
+- `KVCache` 现在按固定 batch 分配连续 K/V 缓冲区，并为每条请求分别维护有效长度；`append`、`advance` 和 key mask 构建统一使用右侧 padding 的 `[B, T]` token mask。padding 和已结束请求不会写入缓存或增长长度。
+- `Qwen3ForCausalLM` 支持右侧 padding 的批量前向与连续缓存。各请求从自己的缓存长度续接 RoPE 位置；`create_kv_cache(max_seq_len, batch_size=...)` 必须显式指定固定批大小。
+- 新增 `GenerationRequest` 和 `greedy_generate_batch`。每条请求可设置不同的 `max_new_tokens` 与 EOS token，结果按输入顺序返回；某条请求结束后保留槽位，其他请求继续生成。EOS 与长度上限同时到达时优先记录 EOS。
+- 新增测试验证不同 prompt 长度、不同结束条件、padding 隔离、批量缓存位置，以及无缓存和连续缓存两种模式下批量生成与单独运行一致。
+- 当前批次成员在 prefill 前固定，尚不支持排队、完成槽位释放或新请求加入，这些行为留待动态调度阶段实现。最后一个已生成 token 只有在被下一轮前向消费时才会写入 KV Cache。
+
 ## 8b36b25 — 连续单请求 KV Cache
 
 - 新增 `KVCache`，按层保存连续 K/V 缓冲区；`Qwen3ForCausalLM.create_kv_cache(max_seq_len)` 按模型的层数、KV 头数、头维度、dtype 和设备创建单请求缓存。
