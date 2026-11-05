@@ -122,7 +122,8 @@ def run_case(model, tokenizer, case, config, case_reference, mode, eos_token_ids
     cache = None
     if mode == "cached":
         cache = model.create_kv_cache(
-            ids.shape[1] + config["generation"]["max_new_tokens"]
+            ids.shape[1] + config["generation"]["max_new_tokens"],
+            batch_size=1,
         )
     result = greedy_generate(
         model,

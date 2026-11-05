@@ -111,14 +111,14 @@ def test_cached_decode_matches_full_forward():
     torch.manual_seed(42)
     model = Qwen3ForCausalLM(make_config()).eval()
     prompt = torch.tensor([[1, 2, 3]])
-    cache = model.create_kv_cache(max_seq_len=5)
+    cache = model.create_kv_cache(max_seq_len=5, batch_size=1)
 
     cached_prefill = model(prompt, cache=cache)
     full_prefill = model(prompt)
     # cached_prefill/full_prefill: [1, 3, V]
 
     torch.testing.assert_close(cached_prefill, full_prefill, rtol=1e-4, atol=1e-5)
-    assert cache.length == 3
+    assert cache.lengths.tolist() == [3]
 
     # ---------- 2. decode one token at each absolute position ----------
     next_token = torch.tensor([[4]])
@@ -127,19 +127,95 @@ def test_cached_decode_matches_full_forward():
     # cached_logits/full_logits: [1, 1, V]
 
     torch.testing.assert_close(cached_logits, full_logits, rtol=1e-4, atol=1e-5)
-    assert cache.length == 4
+    assert cache.lengths.tolist() == [4]
 
     next_token = torch.tensor([[5]])
     cached_logits = model(next_token, cache=cache)
     full_logits = model(torch.tensor([[1, 2, 3, 4, 5]]))[:, -1:, :]
 
     torch.testing.assert_close(cached_logits, full_logits, rtol=1e-4, atol=1e-5)
-    assert cache.length == 5
+    assert cache.lengths.tolist() == [5]
+
+
+@torch.inference_mode()
+def test_batched_cached_decode_matches_individual_forward():
+    """Checks variable prefill lengths and cache positions across a batch."""
+    # ---------- 1. prefill two different-length prompts in one cache ----------
+    torch.manual_seed(42)
+    model = Qwen3ForCausalLM(make_config()).eval()
+    input_ids = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 0],
+        ]
+    )
+    token_mask = torch.tensor(
+        [
+            [True, True, True],
+            [True, True, False],
+        ]
+    )
+    cache = model.create_kv_cache(max_seq_len=6, batch_size=2)
+
+    cached_prefill = model(
+        input_ids,
+        token_mask=token_mask,
+        cache=cache,
+    )
+    assert cache.lengths.tolist() == [3, 2]
+
+    for row, length in enumerate((3, 2)):
+        full = model(input_ids[row : row + 1, :length])
+        torch.testing.assert_close(
+            cached_prefill[row : row + 1, :length],
+            full,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+    # ---------- 2. decode one token for both requests ----------
+    next_tokens = torch.tensor([[6], [7]])
+    cached_logits = model(next_tokens, cache=cache)
+    assert cache.lengths.tolist() == [4, 3]
+
+    expected_0 = model(torch.tensor([[1, 2, 3, 6]]))[:, -1:, :]
+    expected_1 = model(torch.tensor([[4, 5, 7]]))[:, -1:, :]
+
+    torch.testing.assert_close(
+        cached_logits[0:1],
+        expected_0,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        cached_logits[1:2],
+        expected_1,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    # ---------- 3. finish request one while request zero keeps decoding ----------
+    new_mask = torch.tensor([[True], [False]])
+    cached_logits = model(
+        torch.tensor([[8], [0]]),
+        token_mask=new_mask,
+        cache=cache,
+    )
+
+    expected = model(torch.tensor([[1, 2, 3, 6, 8]]))[:, -1:, :]
+    torch.testing.assert_close(
+        cached_logits[0:1],
+        expected,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    assert cache.lengths.tolist() == [5, 3]
+    assert torch.isfinite(cached_logits).all()
 
 
 @pytest.mark.parametrize("shape", [(0,), (1, 0), (1, 2, 3)])
 def test_rejects_unsupported_input_shapes(shape):
-    """Rejects empty sequences, multiple requests and tensors with the wrong rank."""
+    """Rejects empty dimensions and tensors with the wrong rank."""
     model = Qwen3ForCausalLM(make_config())
     with pytest.raises(ValueError, match="input_ids"):
         model(torch.zeros(shape, dtype=torch.long))
@@ -309,20 +385,13 @@ def test_forward_rejects_empty_or_non_right_padded_rows(token_mask):
         )
 
 
-@pytest.mark.parametrize("padded", [False, True])
-def test_cache_rejects_unsupported_batch_or_padding(padded):
-    """Rejects unsupported cached inputs before advancing the cache."""
+def test_cache_rejects_mismatched_batch_before_writing():
+    """Rejects a cache created for a different fixed batch size."""
     model = Qwen3ForCausalLM(make_config())
-    cache = model.create_kv_cache(max_seq_len=4)
+    cache = model.create_kv_cache(max_seq_len=4, batch_size=1)
+    input_ids = torch.tensor([[1, 2], [3, 4]])
 
-    if padded:
-        input_ids = torch.tensor([[1, 2, 0]])
-        token_mask = torch.tensor([[True, True, False]])
-    else:
-        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        token_mask = None
+    with pytest.raises(ValueError, match="batch"):
+        model(input_ids, cache=cache)
 
-    with pytest.raises(ValueError, match="cache"):
-        model(input_ids, token_mask=token_mask, cache=cache)
-
-    assert cache.length == 0
+    assert cache.lengths.tolist() == [0]

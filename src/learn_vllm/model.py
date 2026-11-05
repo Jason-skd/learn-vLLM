@@ -291,11 +291,16 @@ class Attention(nn.Module):
         # q: [B, Hq, T, D]; new k/v: [B, Hkv, T, D]
         q, k = apply_rope(q, k, cos, sin)
 
-        # ---------- 3. append new K/V and read the valid cache prefix ----------
+        # ---------- 3. append valid new K/V and read the cache prefix ----------
         if cache is not None:
             if layer_idx is None:
                 raise ValueError("layer_idx is required when cache is provided.")
-            k, v = cache.append(layer_idx, k, v)
+            k, v = cache.append(
+                layer_idx,
+                k,
+                v,
+                token_mask=query_mask,
+            )
             # k, v: [B, Hkv, Lused, D]
 
         # ---------- 4. compute attention and merge heads ----------
@@ -373,7 +378,7 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    """Qwen3 Backbone: Runs right-padded batches or one cached request.
+    """Qwen3 Backbone: Runs right-padded batches with optional continuous cache.
 
     Only default RoPE, full attention and SiLU are supported. Dropout must be
     zero; this implementation is intended for inference with loaded weights.
@@ -419,9 +424,9 @@ class Qwen3Model(nn.Module):
 
         Args:
             input_ids: [B, T], token IDs with optional right padding.
-            token_mask: [B, T], True for real tokens. Each row must contain
-                a nonempty valid prefix followed by optional padding.
-            cache: Optional cache, currently limited to one unpadded request.
+            token_mask: [B, T], True for real query tokens. Empty rows are
+                allowed when other requests remain active.
+            cache: Optional cache with the same fixed batch size as input_ids.
         Returns:
             [B, T, hidden_size]. Padding positions must be ignored.
         """
@@ -445,48 +450,38 @@ class Qwen3Model(nn.Module):
             raise ValueError(
                 "token_mask must be boolean and on the same device as input_ids."
             )
-        if not token_mask.any(dim=1).all().item():
-            raise ValueError("Each token_mask row must contain a valid token.")
-
         # A right-padded row may change from True to False, never back to True.
         padding_then_token = ~token_mask[:, :-1] & token_mask[:, 1:]
         if padding_then_token.any().item():
             raise ValueError("token_mask must describe right padding.")
 
-        # ---------- 3. preserve the current single-request cache contract ----------
-        start = 0
-        key_mask = token_mask
-        # Without cache, queries and keys come from the same input tokens.
+        if not token_mask.any().item():
+            raise ValueError("token_mask must contain an active token.")
 
+        # ---------- 3. prepare cache position and visibility metadata ----------
         if cache is not None:
-            if batch != 1 or not token_mask.all().item():
-                raise ValueError("cache currently supports only one unpadded request.")
-            cache.ensure_capacity(token_count)
-            start = cache.length
+            if cache.batch_size != batch:
+                raise ValueError("cache batch size must match input_ids.")
 
-            # The existing cache contains only valid tokens.
-            # Its key length includes history and can exceed token_count.
-            key_mask = None
-
-        # ---------- 4. embed tokens and compute absolute positions ----------
-        x = self.embed_tokens(input_ids)
-        # x: [B, T, hidden_size]
-
-        positions = (
-            torch.arange(
-                start,
-                start + token_count,
-                device=input_ids.device,
+            # Requests resume at different absolute positions.
+            starts = cache.lengths.unsqueeze(1)
+            positions = starts + torch.arange(token_count, device=input_ids.device)
+            key_mask = cache.projected_key_mask(token_mask)
+        else:
+            # Without a cache, keys and queries come from the same input.
+            positions = (
+                torch.arange(token_count, device=input_ids.device)
+                .unsqueeze(0)
+                .expand(batch, -1)
             )
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
-        # positions: [B, T]
-        # With right padding, each real token's column is its logical position.
-        # Position values at padding columns are ignored by attention masks.
+            key_mask = token_mask
 
+        # positions: [B, T]
+        # key_mask: [B, Lused] with cache, or [B, T] without a cache.
+
+        # ---------- 4. embed tokens and compute rotary embeddings ----------
+        x = self.embed_tokens(input_ids)
         cos, sin = self.rotary_emb(positions, x.dtype)
-        # cos/sin: [B, T, D], reused by every decoder layer
 
         # ---------- 5. run decoder layers with the same visibility masks ----------
         for layer_idx, layer in enumerate(self.layers):
@@ -501,9 +496,9 @@ class Qwen3Model(nn.Module):
                 layer_idx=layer_idx,
             )
 
-        # ---------- 6. advance the cache after every layer has written ----------
+        # ---------- 6. advance each request after every layer has written ----------
         if cache is not None:
-            cache.advance(token_count)
+            cache.advance(token_mask)
 
         return self.norm(x)
 
@@ -519,13 +514,19 @@ class Qwen3ForCausalLM(nn.Module):
             # Share the parameter itself so loading embeddings also updates the head.
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def create_kv_cache(self, max_seq_len: int) -> KVCache:
+    def create_kv_cache(
+        self,
+        max_seq_len: int,
+        *,
+        batch_size: int,
+    ) -> KVCache:
         """Creates a cache configured from this model's attention layers.
 
         Args:
             max_seq_len: Maximum number of prompt and generated tokens.
+            batch_size: Fixed number of requests occupying batch slots.
         Returns:
-            An empty continuous KV cache for one request.
+            An empty continuous KV cache.
         """
         # ---------- 1. read dimensions from the loaded model ----------
         embedding = self.model.embed_tokens.weight
@@ -537,6 +538,7 @@ class Qwen3ForCausalLM(nn.Module):
             num_kv_heads=attention.num_kv_heads,
             head_dim=attention.head_dim,
             max_seq_len=max_seq_len,
+            batch_size=batch_size,
             dtype=embedding.dtype,
             device=embedding.device,
         )
@@ -553,7 +555,7 @@ class Qwen3ForCausalLM(nn.Module):
         Args:
             input_ids: [B, T], token IDs with optional right padding.
             token_mask: [B, T], True for real tokens.
-            cache: Optional cache, currently limited to one unpadded request.
+            cache: Optional cache with the same fixed batch size as input_ids.
         Returns:
             [B, T, vocab_size]. Padding positions must be ignored.
         """

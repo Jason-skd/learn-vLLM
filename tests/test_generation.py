@@ -1,9 +1,15 @@
 import pytest
 import torch
 from torch import Tensor, nn
+from transformers import Qwen3Config
 
-from learn_vllm.generation import greedy_generate
+from learn_vllm.generation import (
+    GenerationRequest,
+    greedy_generate,
+    greedy_generate_batch,
+)
 from learn_vllm.kv_cache import KVCache
+from learn_vllm.model import Qwen3ForCausalLM
 
 
 class LastTokenModel(nn.Module):
@@ -20,7 +26,8 @@ class LastTokenModel(nn.Module):
         self.input_lengths.append(input_ids.shape[1])
         self.cache_inputs.append(cache)
         if cache is not None:
-            cache.advance(input_ids.shape[1])
+            token_mask = torch.ones_like(input_ids, dtype=torch.bool)
+            cache.advance(token_mask)
 
         token = self.next_tokens[len(self.input_lengths) - 1]
         logits = torch.full(
@@ -57,6 +64,7 @@ def test_greedy_generate_uses_cache_and_feeds_one_token_at_a_time():
         num_kv_heads=1,
         head_dim=1,
         max_seq_len=4,
+        batch_size=1,
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
@@ -71,7 +79,7 @@ def test_greedy_generate_uses_cache_and_feeds_one_token_at_a_time():
 
     assert model.input_lengths == [2, 1]
     assert all(actual is cache for actual in model.cache_inputs)
-    assert cache.length == 3
+    assert cache.lengths.tolist() == [3]
     torch.testing.assert_close(
         result.generated_ids, torch.tensor([[2, 4]]), rtol=0, atol=0
     )
@@ -108,3 +116,92 @@ def test_greedy_generate_rejects_nonpositive_limit():
             torch.tensor([[1, 6]]),
             max_new_tokens=0,
         )
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+@torch.inference_mode()
+def test_greedy_generate_batch_matches_individual_runs(use_cache):
+    """Checks variable lengths, EOS, limits and cache positions in a batch."""
+    # ---------- 1. build a deterministic model and two distinct requests ----------
+    torch.manual_seed(42)
+    config = Qwen3Config(
+        vocab_size=67,
+        hidden_size=24,
+        intermediate_size=40,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+    )
+    model = Qwen3ForCausalLM(config).eval()
+
+    prompt_0 = torch.tensor([[1, 2, 3]])
+    prompt_1 = torch.tensor([[4, 5]])
+    first_token_1 = model(prompt_1)[0, -1].argmax().item()
+    requests = [
+        GenerationRequest(prompt_0, max_new_tokens=4),
+        GenerationRequest(
+            prompt_1,
+            max_new_tokens=3,
+            eos_token_ids=first_token_1,
+        ),
+    ]
+
+    # ---------- 2. run the fixed batch and separate reference requests ----------
+    batch_cache = (
+        model.create_kv_cache(max_seq_len=7, batch_size=2) if use_cache else None
+    )
+    actual = greedy_generate_batch(model, requests, cache=batch_cache)
+
+    expected = []
+    for request in requests:
+        cache = (
+            model.create_kv_cache(
+                max_seq_len=request.input_ids.shape[1] + request.max_new_tokens,
+                batch_size=1,
+            )
+            if use_cache
+            else None
+        )
+        expected.append(
+            greedy_generate(
+                model,
+                request.input_ids,
+                max_new_tokens=request.max_new_tokens,
+                eos_token_ids=request.eos_token_ids,
+                cache=cache,
+            )
+        )
+
+    # ---------- 3. require every observable generation result to agree ----------
+    for actual_result, expected_result in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            actual_result.prefill_logits,
+            expected_result.prefill_logits,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            actual_result.generation_logits,
+            expected_result.generation_logits,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            actual_result.generated_ids,
+            expected_result.generated_ids,
+            rtol=0,
+            atol=0,
+        )
+        assert actual_result.stop_reason == expected_result.stop_reason
+
+    assert [result.stop_reason for result in actual] == [
+        "max_new_tokens",
+        "eos",
+    ]
+    assert [result.generated_ids.shape[1] for result in actual] == [4, 1]
+
+    if use_cache:
+        assert batch_cache is not None
+        # The final generated token is not consumed by another forward pass.
+        assert batch_cache.lengths.tolist() == [6, 2]
