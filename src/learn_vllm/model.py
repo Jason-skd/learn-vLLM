@@ -99,18 +99,26 @@ def causal_attention(
     k: Tensor,
     v: Tensor,
     query_positions: Tensor,
+    *,
+    key_mask: Tensor | None = None,
+    query_mask: Tensor | None = None,
 ) -> Tensor:
-    """Computes grouped-query causal attention for new query tokens.
+    """Computes grouped-query causal attention with optional padding masks.
 
     Args:
         q: [B, Hq, T, D]
         k: [B, Hkv, Lused, D]
         v: [B, Hkv, Lused, D]
         query_positions: [B, T], absolute positions of the new queries.
+        key_mask: [B, Lused], True for valid key/value positions.
+        query_mask: [B, T], True for valid query positions.
     Returns:
-        [B, Hq, T, D]
+        [B, Hq, T, D]. Queries without visible keys return zeros.
+
+    Key columns represent consecutive positions starting at zero.
+    This supports right padding and compact continuous cache prefixes.
     """
-    # ---------- 1. obtain and validate the quantity of attention heads ----------
+    # ---------- 1. validate tensor shapes and attention heads ----------
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("Queries, keys and values must be rank-4 tensors.")
 
@@ -121,33 +129,71 @@ def causal_attention(
         raise ValueError("Keys and values must have the same shape.")
     if q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
         raise ValueError("Queries, keys and values must have matching B and D.")
-    if query_positions.shape != (q.shape[0], q.shape[-2]):
+
+    batch, _, token_count, head_dim = q.shape
+    key_length = k.shape[-2]
+    if key_length == 0:
+        raise ValueError("Keys and values must contain at least one position.")
+    if query_positions.shape != (batch, token_count):
         raise ValueError("query_positions must have shape [B, T].")
 
-    # --------- 2. duplicate the KV header ----------
+    # ---------- 2. prepare valid key and query masks ----------
+    if key_mask is None:
+        key_mask = torch.ones((batch, key_length), dtype=torch.bool, device=q.device)
+    if query_mask is None:
+        query_mask = torch.ones((batch, token_count), dtype=torch.bool, device=q.device)
+
+    for name, mask, shape in (
+        ("key_mask", key_mask, (batch, key_length)),
+        ("query_mask", query_mask, (batch, token_count)),
+    ):
+        if mask.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}.")
+        if mask.dtype != torch.bool or mask.device != q.device:
+            raise ValueError(
+                f"{name} must be boolean and on the same device as queries."
+            )
+
+    # ---------- 3. repeat KV heads to match query heads ----------
     groups = query_heads // kv_heads
     k = k.repeat_interleave(groups, dim=1)
     v = v.repeat_interleave(groups, dim=1)
-    # k/v: [B, Hq, L, D], notice that Hkv -> Hq
+    # k/v: [B, Hq, Lused, D]
 
-    # --------- 3. compute the attention ----------
-    _, head_dim = q.shape[-2:]
+    # ---------- 4. compute attention scores ----------
     scores = (q @ k.transpose(-2, -1)) * (head_dim**-0.5)
     # scores: [B, Hq, T, Lused]
 
-    # --------- 4. mask out future tokens ----------
-    key_length = k.shape[-2]
+    # ---------- 5. combine causal and padding constraints ----------
     key_positions = torch.arange(key_length, device=q.device)
+    causal = key_positions.view(1, 1, -1) <= query_positions.unsqueeze(-1)
+    # causal: [B, T, Lused]
 
-    future = key_positions.view(1, 1, -1) > query_positions.unsqueeze(-1)
-    # future: [B, T, L]
+    allowed = causal & key_mask.unsqueeze(1) & query_mask.unsqueeze(-1)
+    # allowed: [B, T, Lused]
+    # A query can attend only to valid keys at or before its own position.
 
-    scores = scores.masked_fill(future.unsqueeze(1), float("-inf"))
-    # mask broadcast: [B, 1, T, L], scores: [B, Hq, T, L]
+    allowed = allowed.unsqueeze(1)
+    # allowed: [B, 1, T, Lused], shared by all query heads
 
-    # --------- 5. calculate the probability ----------
+    scores = scores.masked_fill(~allowed, float("-inf"))
+
+    # ---------- 6. handle queries without any visible key ----------
+    has_keys = allowed.any(dim=-1, keepdim=True)
+    # has_keys: [B, 1, T, 1]
+
+    # Softmax over only -inf values produces NaN.
+    # Use finite scores for these rows, then clear their probabilities below.
+    scores = scores.masked_fill(~has_keys, 0.0)
+
     probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    probabilities = probabilities.masked_fill(~allowed, 0.0)
+    # probabilities: [B, Hq, T, Lused]
+    # Invalid query rows now contain only zeros.
+
+    # ---------- 7. combine values using attention probabilities ----------
     return probabilities @ v
+    # output: [B, Hq, T, D]
 
 
 class MLP(nn.Module):
@@ -215,6 +261,8 @@ class Attention(nn.Module):
         *,
         cache: KVCache | None = None,
         layer_idx: int | None = None,
+        key_mask: Tensor | None = None,
+        query_mask: Tensor | None = None,
     ) -> Tensor:
         """Projects, normalizes and rotates queries and keys before attention.
 
@@ -225,6 +273,8 @@ class Attention(nn.Module):
             position_ids: [B, T] absolute token positions.
             cache: Optional KV cache for this request.
             layer_idx: Index of this attention layer in the decoder.
+            key_mask: [B, Lused], True for valid key/value positions.
+            query_mask: [B, T], True for valid new query positions.
         Returns:
             [B, T, hidden_size]
         """
@@ -249,7 +299,14 @@ class Attention(nn.Module):
             # k, v: [B, Hkv, Lused, D]
 
         # ---------- 4. compute attention and merge heads ----------
-        output = causal_attention(q, k, v, position_ids)
+        output = causal_attention(
+            q,
+            k,
+            v,
+            position_ids,
+            key_mask=key_mask,
+            query_mask=query_mask,
+        )
         # output: [B, Hq, T, D]
 
         output = output.transpose(1, 2).reshape(batch, length, -1)
@@ -276,6 +333,8 @@ class DecoderLayer(nn.Module):
         *,
         cache: KVCache | None = None,
         layer_idx: int | None = None,
+        key_mask: Tensor | None = None,
+        query_mask: Tensor | None = None,
     ) -> Tensor:
         """Applies attention and the feed-forward transformation.
 
@@ -286,13 +345,24 @@ class DecoderLayer(nn.Module):
             position_ids: [B, T] absolute token positions.
             cache: Optional KV cache for this request.
             layer_idx: Index of this attention layer in the decoder.
+            key_mask: [B, Lused], True for valid key/value positions.
+            query_mask: [B, T], True for valid new query positions.
         Returns:
             [B, T, hidden_size]
         """
         # ---------- 1. attention with residual connection ----------
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, cos, sin, position_ids, cache=cache, layer_idx=layer_idx)
+        x = self.self_attn(
+            x,
+            cos,
+            sin,
+            position_ids,
+            cache=cache,
+            layer_idx=layer_idx,
+            key_mask=key_mask,
+            query_mask=query_mask,
+        )
         x = residual + x
 
         # ---------- 2. MLP with residual connection ----------
@@ -303,7 +373,7 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    """Qwen3 Backbone: Runs one unpadded sequence with optional continuous cache.
+    """Qwen3 Backbone: Runs right-padded batches or one cached request.
 
     Only default RoPE, full attention and SiLU are supported. Dropout must be
     zero; this implementation is intended for inference with loaded weights.
@@ -338,41 +408,100 @@ class Qwen3Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids: Tensor, *, cache: KVCache | None = None) -> Tensor:
-        """Embeds input tokens and runs all decoder layers.
+    def forward(
+        self,
+        input_ids: Tensor,
+        *,
+        token_mask: Tensor | None = None,
+        cache: KVCache | None = None,
+    ) -> Tensor:
+        """Embeds tokens and runs all decoder layers.
 
         Args:
-            input_ids: [1, T], a nonempty sequence without padding.
-            cache: Optional KV cache containing previously processed tokens.
+            input_ids: [B, T], token IDs with optional right padding.
+            token_mask: [B, T], True for real tokens. Each row must contain
+                a nonempty valid prefix followed by optional padding.
+            cache: Optional cache, currently limited to one unpadded request.
         Returns:
-            [1, T, hidden_size]
+            [B, T, hidden_size]. Padding positions must be ignored.
         """
-        # ---------- 1. validate input and the shared cache range ----------
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
-            raise ValueError("input_ids must have shape [1, L] with L > 0.")
+        # ---------- 1. validate input dimensions ----------
+        if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must have shape [B, T] with B, T > 0.")
 
-        token_count = input_ids.shape[1]
-        start = cache.length if cache is not None else 0
+        batch, token_count = input_ids.shape
+
+        # ---------- 2. prepare and validate the right-padding mask ----------
+        if token_mask is None:
+            token_mask = torch.ones(
+                input_ids.shape,
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+
+        if token_mask.shape != input_ids.shape:
+            raise ValueError("token_mask must have the same shape as input_ids.")
+        if token_mask.dtype != torch.bool or token_mask.device != input_ids.device:
+            raise ValueError(
+                "token_mask must be boolean and on the same device as input_ids."
+            )
+        if not token_mask.any(dim=1).all().item():
+            raise ValueError("Each token_mask row must contain a valid token.")
+
+        # A right-padded row may change from True to False, never back to True.
+        padding_then_token = ~token_mask[:, :-1] & token_mask[:, 1:]
+        if padding_then_token.any().item():
+            raise ValueError("token_mask must describe right padding.")
+
+        # ---------- 3. preserve the current single-request cache contract ----------
+        start = 0
+        key_mask = token_mask
+        # Without cache, queries and keys come from the same input tokens.
+
         if cache is not None:
+            if batch != 1 or not token_mask.all().item():
+                raise ValueError("cache currently supports only one unpadded request.")
             cache.ensure_capacity(token_count)
+            start = cache.length
 
-        # ---------- 2. embed tokens and compute shared position embeddings ----------
+            # The existing cache contains only valid tokens.
+            # Its key length includes history and can exceed token_count.
+            key_mask = None
+
+        # ---------- 4. embed tokens and compute absolute positions ----------
         x = self.embed_tokens(input_ids)
-        positions = torch.arange(
-            start,
-            start + token_count,
-            device=input_ids.device,
-        ).unsqueeze(0)
-        # positions: [1, T] int64 absolute token positions
+        # x: [B, T, hidden_size]
+
+        positions = (
+            torch.arange(
+                start,
+                start + token_count,
+                device=input_ids.device,
+            )
+            .unsqueeze(0)
+            .expand(batch, -1)
+        )
+        # positions: [B, T]
+        # With right padding, each real token's column is its logical position.
+        # Position values at padding columns are ignored by attention masks.
 
         cos, sin = self.rotary_emb(positions, x.dtype)
-        # cos/sin: [1, T, D], reused by every decoder layer
+        # cos/sin: [B, T, D], reused by every decoder layer
 
-        # ---------- 3. run decoder layers and normalize ----------
+        # ---------- 5. run decoder layers with the same visibility masks ----------
         for layer_idx, layer in enumerate(self.layers):
-            x = layer(x, cos, sin, positions, cache=cache, layer_idx=layer_idx)
+            x = layer(
+                x,
+                cos,
+                sin,
+                positions,
+                key_mask=key_mask,
+                query_mask=token_mask,
+                cache=cache,
+                layer_idx=layer_idx,
+            )
 
-        # ---------- 4. advance only after every layer has written the token range ----------
+        # ---------- 6. advance the cache after every layer has written ----------
         if cache is not None:
             cache.advance(token_count)
 
@@ -416,15 +545,21 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: Tensor,
         *,
+        token_mask: Tensor | None = None,
         cache: KVCache | None = None,
     ) -> Tensor:
-        """Computes logits for every input position without generating tokens.
+        """Computes logits for every input position.
 
         Args:
-            input_ids: [1, T], a nonempty sequence without padding.
-            cache: Optional KV cache containing previously processed tokens.
+            input_ids: [B, T], token IDs with optional right padding.
+            token_mask: [B, T], True for real tokens.
+            cache: Optional cache, currently limited to one unpadded request.
         Returns:
-            [1, T, vocab_size]
+            [B, T, vocab_size]. Padding positions must be ignored.
         """
-        hidden_states = self.model(input_ids, cache=cache)
+        hidden_states = self.model(
+            input_ids,
+            token_mask=token_mask,
+            cache=cache,
+        )
         return self.lm_head(hidden_states)
