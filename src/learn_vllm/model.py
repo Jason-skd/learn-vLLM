@@ -259,21 +259,7 @@ class Qwen3Model(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
         # ---------- 1. check the supported model configuration ----------
-        if config.hidden_act != "silu":
-            raise ValueError("Only SiLU activation is supported.")
-        if config.attention_dropout != 0:
-            raise ValueError("Attention dropout must be zero.")
-        if any(layer_type != "full_attention" for layer_type in config.layer_types):
-            raise ValueError("Only full attention is supported.")
-        rope = config.rope_parameters
-        if rope.get("rope_type", "default") != "default":
-            raise ValueError("Only default RoPE is supported.")
-        if (
-            config.num_attention_heads <= 0
-            or config.num_key_value_heads <= 0
-            or config.num_attention_heads % config.num_key_value_heads != 0
-        ):
-            raise ValueError("Query heads must be a positive multiple of KV heads.")
+        rope = self._validate_config_and_resolve_rope(config)
 
         # ---------- 2. build embeddings, decoder layers and final norm ----------
         self.embed_tokens = nn.Embedding(
@@ -284,6 +270,21 @@ class Qwen3Model(nn.Module):
             [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    @staticmethod
+    def _validate_config_and_resolve_rope(config: Qwen3Config) -> dict:
+        """Validate the supported configuration and return resolved RoPE params."""
+        if config.hidden_act != "silu":
+            raise ValueError("Only SiLU activation is supported.")
+        if config.attention_dropout != 0:
+            raise ValueError("Attention dropout must be zero.")
+        if any(layer_type != "full_attention" for layer_type in config.layer_types):
+            raise ValueError("Only full attention is supported.")
+
+        rope = config.rope_parameters
+        if rope.get("rope_type", "default") != "default":
+            raise ValueError("Only default RoPE is supported.")
+        return rope
 
     def forward(self, input_ids: Tensor) -> Tensor:
         """Embeds input tokens and runs all decoder layers.
