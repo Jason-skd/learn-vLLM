@@ -30,6 +30,7 @@ def greedy_generate(
     # ---------- 2. prepare vars ----------
     sequence = input_ids
     generated, step_logits = [], []
+    prefill_logits: Tensor | None = None
 
     # eos may be None / int / list[int]; normalize to a set for O(1) lookup
     eos_ids = (
@@ -68,6 +69,8 @@ def greedy_generate(
         # sequence: [1, L + step + 1]
 
     # ---------- 4. pack ----------
+    # A positive generation limit guarantees at least one forward pass.
+    assert prefill_logits is not None
     new_ids = torch.cat(generated, dim=1)
     # new_ids: [1, N]
 
