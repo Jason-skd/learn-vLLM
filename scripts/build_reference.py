@@ -36,6 +36,7 @@ def run_case(model, tokenizer, case, config):
     generated, step_logits = [], []
     # generated:   list, length N at the end, each item [1, 1]
     # step_logits: list, length N at the end, each item [1, V]
+    prefill_logits: torch.Tensor | None = None
 
     eos = model.generation_config.eos_token_id
     # eos may be None / int / list[int]; normalize to a set for O(1) lookup
@@ -79,6 +80,8 @@ def run_case(model, tokenizer, case, config):
         # attention: [1, L + step + 1]  append one more 1
 
     # ---------- 4. pack ----------
+    # main() validates that the generation limit is positive.
+    assert prefill_logits is not None
     new_ids = torch.cat(generated, dim=1)
     # new_ids: [1, N]
 

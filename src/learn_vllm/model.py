@@ -31,6 +31,8 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     """Rotary Embedding: Computes cosine and sine values for default RoPE."""
 
+    inv_freq: Tensor
+
     def __init__(self, head_dim: int, theta: float):
         super().__init__()
         if head_dim <= 0 or head_dim % 2 != 0:
@@ -162,6 +164,8 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        if self.num_kv_heads is None:
+            raise ValueError("num_key_value_heads must be resolved before attention.")
 
         self.q_proj = nn.Linear(
             config.hidden_size,
@@ -278,13 +282,15 @@ class Qwen3Model(nn.Module):
             raise ValueError("Only SiLU activation is supported.")
         if config.attention_dropout != 0:
             raise ValueError("Attention dropout must be zero.")
-        if any(layer_type != "full_attention" for layer_type in config.layer_types):
+        if config.layer_types is None or any(
+            layer_type != "full_attention" for layer_type in config.layer_types
+        ):
             raise ValueError("Only full attention is supported.")
 
         rope = config.rope_parameters
-        if rope.get("rope_type", "default") != "default":
+        if rope is None or rope.get("rope_type", "default") != "default":
             raise ValueError("Only default RoPE is supported.")
-        return rope
+        return dict(rope)
 
     def forward(self, input_ids: Tensor) -> Tensor:
         """Embeds input tokens and runs all decoder layers.
