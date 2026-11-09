@@ -44,7 +44,7 @@ def greedy_generate(
     # ---------- 3. generate ----------
     for step in range(max_new_tokens):
         # At iteration `step`, sequence length is L + step.
-        output_logits = model(sequence)
+        output_logits, _ = model(sequence)
         # output_logits: [1, L + step, V]
 
         if step == 0:
