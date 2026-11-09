@@ -1,5 +1,11 @@
 # Changelog
 
+## fbf6767 — 连续单请求 KV Cache
+
+- `Qwen3ForCausalLM.forward` 支持传入各层的 `past_key_values` 并返回更新后的缓存；K/V 按 token 维度连续拼接，RoPE 位置从缓存长度继续计算。
+- 新增 `greedy_generate_cached`：首次前向处理完整 prompt，后续每步只处理新生成的 token。原 `greedy_generate` 保留为完整上下文基线，供逐步 logits 对齐。
+- 缓存生成仅支持非空、无 padding 的单请求；缓存通过每次调用显式传递，容量随序列增长。默认测试比较缓存与无缓存路径的 logits 和生成结果，不加载真实模型权重。
+
 ## 269f03d — 参考生成集成测试
 
 - 将 `scripts/compare_generation.py` 迁移为 `tests/test_generation_reference.py`，按 `reference/config.json` 的用例逐个报告 tokenizer、logits、生成 token、停止原因和文本的对比结果。

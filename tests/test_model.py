@@ -6,7 +6,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
-from learn_vllm.model import Qwen3ForCausalLM, RotaryEmbedding
+from learn_vllm.model import Attention, Qwen3ForCausalLM, RotaryEmbedding
 
 
 def make_config(**kwargs):
@@ -69,7 +69,7 @@ def test_forward_matches_reference(length, tied, bias):
 
     # ---------- 3. run full-context forward passes and remove hooks ----------
     try:
-        logits = model(ids)
+        logits, _ = model(ids)
         reference_logits = reference(ids, use_cache=False).logits
         # logits/reference_logits: [1, L, vocab_size]
     finally:
@@ -98,10 +98,13 @@ def test_future_tokens_do_not_change_prefix_logits():
     # ids/changed: [1, 5]; only the final two tokens differ
 
     # ---------- 2. verify that future token values cannot affect the prefix ----------
-    torch.testing.assert_close(model(ids)[:, :3], model(changed)[:, :3])
+    logits, _ = model(ids)
+    changed_logits, _ = model(changed)
+    torch.testing.assert_close(logits[:, :3], changed_logits[:, :3])
 
     # ---------- 3. verify that removing future tokens preserves the prefix ----------
-    torch.testing.assert_close(model(ids)[:, :3], model(ids[:, :3]))
+    prefix_logits, _ = model(ids[:, :3])
+    torch.testing.assert_close(logits[:, :3], prefix_logits)
 
 
 @pytest.mark.parametrize("shape", [(0,), (1, 0), (2, 3), (1, 2, 3)])
@@ -125,3 +128,114 @@ def test_rejects_unsupported_configurations(options, message):
     """Rejects configurations whose behavior the current forward cannot reproduce."""
     with pytest.raises(ValueError, match=message):
         Qwen3ForCausalLM(make_config(**options))
+
+
+@torch.inference_mode()
+def test_attention_cached_suffix_matches_full_sequence():
+    # ---------- 1. prepare a small attention module and a RoPE module ----------
+    config = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        attention_dropout=0.0,
+    )
+    attention = Attention(config).eval()
+    rope = RotaryEmbedding(head_dim=4, theta=10000.0)
+
+    # --------- 2. prepare a random input sequence and compute the full attention ----------
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 5, 16, generator=generator, dtype=torch.float32)
+
+    positions = torch.arange(5).unsqueeze(0)
+    cos, sin = rope(positions, dtype=x.dtype)
+
+    full_output, _ = attention(x, cos, sin)
+
+    # --------- 3. compute the attention in two parts, caching the first part ----------
+    _, cache = attention(
+        x[:, :3],
+        cos[:, :3],
+        sin[:, :3],
+    )
+    suffix_output, _ = attention(
+        x[:, 3:],
+        cos[:, 3:],
+        sin[:, 3:],
+        past_key_value=cache,
+    )
+
+    # --------- 4. verify that the cached suffix matches the full sequence ----------
+    torch.testing.assert_close(
+        suffix_output,
+        full_output[:, 3:],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("prefix_length", [1, 3, 4])
+@torch.inference_mode()
+def test_model_cached_suffix_matches_full_sequence(prefix_length):
+    """Checks cached logits and cache growth across all decoder layers."""
+    # ---------- 1. prepare a small model and a fixed token sequence ----------
+    torch.manual_seed(42)
+    config = make_config()
+    model = Qwen3ForCausalLM(config).eval()
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    # ---------- 2. compute the full sequence and the cached prefix ----------
+    full_logits, _ = model(ids)
+    prefix_logits, cache = model(ids[:, :prefix_length])
+
+    assert len(cache) == config.num_hidden_layers
+    for k, v in cache:
+        assert (
+            k.shape
+            == v.shape
+            == (
+                1,
+                config.num_key_value_heads,
+                prefix_length,
+                config.head_dim,
+            )
+        )
+
+    # ---------- 3. process only the suffix using the prefix cache ----------
+    suffix_logits, updated_cache = model(
+        ids[:, prefix_length:],
+        past_key_values=cache,
+    )
+
+    # ---------- 4. compare logits and verify that every cache grew ----------
+    torch.testing.assert_close(
+        prefix_logits,
+        full_logits[:, :prefix_length],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        suffix_logits,
+        full_logits[:, prefix_length:],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    for k, v in updated_cache:
+        assert (
+            k.shape
+            == v.shape
+            == (
+                1,
+                config.num_key_value_heads,
+                ids.shape[1],
+                config.head_dim,
+            )
+        )
+
+    # Concatenation creates new tensors; the supplied prefix cache stays usable.
+    for k, v in cache:
+        assert k.shape[2] == v.shape[2] == prefix_length

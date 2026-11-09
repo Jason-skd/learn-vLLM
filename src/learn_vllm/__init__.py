@@ -1,6 +1,6 @@
-from .generation import GenerationResult, greedy_generate
+from .generation import GenerationResult, greedy_generate, greedy_generate_cached
 
-__all__ = ["GenerationResult", "greedy_generate"]
+__all__ = ["GenerationResult", "greedy_generate", "greedy_generate_cached"]
 
 
 def main() -> None:

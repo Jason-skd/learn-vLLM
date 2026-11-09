@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
 from learn_vllm.generation import greedy_generate
 from learn_vllm.model import Qwen3ForCausalLM
@@ -88,6 +88,7 @@ def runtime(reference_artifact):
     if not config["generation"]["stop_on_eos"]:
         eos_ids = []
 
+    assert isinstance(reference_model.config, Qwen3Config)
     model = Qwen3ForCausalLM(reference_model.config)
     model.load_state_dict(reference_model.state_dict(), strict=True)
     model = model.to(device=mc["device"], dtype=getattr(torch, mc["dtype"])).eval()
